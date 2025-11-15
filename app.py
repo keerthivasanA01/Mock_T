@@ -1,14 +1,10 @@
 # app.py
 """
-Mock Test Backend (Flask) — FINAL CLEAN VERSION
-
-Features:
- - PDF Upload
- - Text Extraction
- - MCQ / 2-Mark / 13-Mark Generation using Gemini API
- - AI-Based Evaluation for 2-Mark & 13-Mark
- - Robust JSON extraction
- - Production-ready for Render
+Mock Test Backend (Flask) — FINAL VERSION WITH /debugkey
+ - Uses GEMINI_API_KEY from Render env (NO HARDCODED KEY)
+ - Generates MCQ / 2-Mark / 13-Mark
+ - Evaluates answers using Gemini AI
+ - Includes /debugkey route to verify API key is loaded
 """
 
 import os
@@ -25,7 +21,7 @@ import requests
 # CONFIG
 # -------------------------
 ALLOWED_EXTENSIONS = {"pdf"}
-MAX_CONTENT_LENGTH = 20 * 1024 * 1024  # 20MB max upload
+MAX_CONTENT_LENGTH = 20 * 1024 * 1024  # 20MB max upload size
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 DEFAULT_MAX_TOKENS = 1200
@@ -44,31 +40,30 @@ def allowed_file(filename: str) -> bool:
 
 
 def extract_text(pdf_bytes: bytes, max_pages: int = 40) -> str:
-    """Extracts text from a PDF file."""
+    """Extracts text from PDF."""
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    pages = reader.pages[:max_pages]
-    text_blocks = []
+    texts = []
 
-    for p in pages:
+    for page in reader.pages[:max_pages]:
         try:
-            txt = p.extract_text() or ""
+            txt = page.extract_text() or ""
         except:
             txt = ""
         if txt.strip():
-            text_blocks.append(txt)
+            texts.append(txt)
 
-    return "\n".join(text_blocks)
+    return "\n".join(texts)
 
 
 def _find_first_string(obj) -> Optional[str]:
-    """Recursively find first textual output from Gemini API response."""
+    """Search through Gemini JSON to find first string text."""
     if obj is None:
         return None
     if isinstance(obj, str):
         return obj
     if isinstance(obj, list):
-        for v in obj:
-            s = _find_first_string(v)
+        for x in obj:
+            s = _find_first_string(x)
             if s:
                 return s
     if isinstance(obj, dict):
@@ -80,27 +75,29 @@ def _find_first_string(obj) -> Optional[str]:
 
 
 def _extract_balanced_json(text: str) -> Optional[str]:
-    """Extract first valid {...} block from LLM messy output."""
+    """Extracts first {...} valid block."""
     start = text.find("{")
     if start == -1:
         return None
+
     depth = 0
     for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
+        if text[i] == "{":
             depth += 1
-        elif ch == "}":
+        elif text[i] == "}":
             depth -= 1
             if depth == 0:
-                return text[start:i+1]
+                return text[start:i + 1]
+
     return None
 
 
 def extract_json(text: str):
-    """Parse JSON from Gemini output safely."""
-    if not text or not isinstance(text, str):
+    """Parse LLM output safely."""
+    if not isinstance(text, str):
         return {"raw": text}
 
+    # direct attempt
     try:
         return json.loads(text)
     except:
@@ -115,13 +112,13 @@ def extract_json(text: str):
 
 
 # -------------------------
-# GEMINI API WRAPPER
+# GEMINI API CALL
 # -------------------------
 def gemini_api(prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS, timeout: int = 120) -> str:
-    """Calls Gemini API and returns best textual candidate."""
+    """Calls Gemini using environment API key."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("❌ GEMINI_API_KEY is NOT set in environment variables!")
+        raise RuntimeError("❌ GEMINI_API_KEY is NOT SET in environment variables.")
 
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -135,68 +132,57 @@ def gemini_api(prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS, timeout: int =
 
     headers = {"Content-Type": "application/json"}
 
-    last_exception = None
+    last_error = None
     for attempt in range(1, GEMINI_RETRIES + 1):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
             resp.raise_for_status()
+
             data = resp.json()
 
-            # Expected structure: candidates → content → parts → text
-            try:
-                cand = data.get("candidates", [])
-                if cand:
-                    content = cand[0].get("content", {})
-                    parts = content.get("parts", [])
-                    if parts:
-                        part = parts[0]
-                        if isinstance(part, dict) and "text" in part:
-                            return part["text"]
-                        text_val = _find_first_string(part)
-                        if text_val:
-                            return text_val
+            # candidate structure
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    part0 = parts[0]
+                    if isinstance(part0, dict) and "text" in part0:
+                        return part0["text"]
+                    txt = _find_first_string(part0)
+                    if txt:
+                        return txt
 
-                # fallback search
-                fallback = _find_first_string(data)
-                return fallback or json.dumps(data)
-
-            except Exception:
-                return json.dumps(data)
+            # fallback
+            fallback = _find_first_string(data)
+            return fallback or json.dumps(data)
 
         except Exception as e:
-            last_exception = e
+            last_error = e
             if attempt < GEMINI_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
-            else:
-                break
 
-    raise RuntimeError(f"Gemini API failed after retries: {last_exception}")
+    raise RuntimeError(f"Gemini API failed after retries: {last_error}")
 
 
 # -------------------------
 # PROMPT BUILDERS
 # -------------------------
-def normalize_counts(user_counts: dict):
-    """Normalizes counts to keys: mcq, two_mark, thirteen_mark"""
+def normalize_counts(raw):
     out = {"mcq": 5, "two_mark": 5, "thirteen_mark": 2}
-    if not isinstance(user_counts, dict):
+    if not isinstance(raw, dict):
         return out
-
-    for k, v in user_counts.items():
+    for k, v in raw.items():
         try:
             v = int(v)
         except:
             continue
-
-        key = str(k).lower()
-
-        if key.startswith("mcq"):
+        k = str(k).lower()
+        if "mcq" in k:
             out["mcq"] = v
-        elif "2" in key or "two" in key:
+        elif "2" in k or "two" in k:
             out["two_mark"] = v
-        elif "13" in key or "thirteen" in key:
+        elif "13" in k or "thirteen" in k:
             out["thirteen_mark"] = v
-
     return out
 
 
@@ -204,45 +190,45 @@ def build_prompt(text, domain, subject, difficulty, language, counts):
     snippet = text[:6000]
 
     return f"""
-You are an exam-question generator. Return STRICT JSON.
+Generate exam questions STRICTLY in JSON:
 
 SCHEMA:
 {{
   "mcq": [
     {{
-      "question": "...",
+      "question": "",
       "options": ["A) ...","B) ...","C) ...","D) ..."],
-      "answer": "A||explanation",
+      "answer": "A||short explanation",
       "marks": 1
     }}
   ],
   "two_mark": [
     {{
-      "question": "...",
-      "answer": "...",
+      "question": "",
+      "answer": "",
       "marks": 2
     }}
   ],
   "thirteen_mark": [
     {{
-      "question": "...",
-      "answer_outline": "...",
+      "question": "",
+      "answer_outline": "",
       "marks": 13
     }}
   ]
 }}
 
 Generate:
-- {counts["mcq"]} MCQs
-- {counts["two_mark"]} two-mark
-- {counts["thirteen_mark"]} thirteen-mark
+- {counts["mcq"]} MCQs  
+- {counts["two_mark"]} two-mark  
+- {counts["thirteen_mark"]} thirteen-mark  
 
 Domain: {domain}
 Subject: {subject}
 Difficulty: {difficulty}
 Language: {language}
 
-SOURCE:
+SOURCE CONTENT:
 {text}
 
 Return ONLY JSON.
@@ -251,7 +237,7 @@ Return ONLY JSON.
 
 def build_eval_prompt(q_type, question, correct, user, marks):
     return f"""
-Evaluate the student's answer.
+Evaluate the answer.
 
 TYPE: {q_type}
 MAX MARKS: {marks}
@@ -266,44 +252,54 @@ STUDENT ANSWER:
 {user}
 
 Return STRICT JSON:
-{{ "score": <number>, "feedback": "<short feedback>" }}
+{{ "score": <0-{marks}>, "feedback": "..." }}
 """
 
 
 # -------------------------
 # ROUTES
 # -------------------------
-@app.route("/", methods=["GET"])
-def root():
-    return {"ok": True, "service": "Mock-Test Backend"}
+@app.route("/")
+def home():
+    return {"ok": True, "service": "Mock Test Backend"}
 
 
-# ---------------------- GENERATION ----------------------
+# TEMP DEBUG ROUTE (remove after testing)
+@app.route("/debugkey")
+def debugkey():
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return {"GEMINI_API_KEY": None, "message": "❌ NOT LOADED"}, 200
+    return {"GEMINI_API_KEY": key[:6] + "********", "message": "✅ Loaded"}, 200
+
+
+# ---------------------- GENERATE ------------------------
 @app.route("/generate", methods=["POST"])
 def generate():
     if "file" not in request.files:
-        return {"error": "Upload a PDF using field 'file'"}, 400
+        return {"error": "Upload PDF as 'file'"}, 400
 
-    file = request.files["file"]
-    if not allowed_file(file.filename):
+    f = request.files["file"]
+    if not allowed_file(f.filename):
         return {"error": "Only PDF allowed"}, 400
 
-    pdf_bytes = file.read()
+    pdf_bytes = f.read()
 
     try:
         text = extract_text(pdf_bytes)
     except Exception as e:
-        return {"error": "Failed to extract text", "details": str(e)}, 500
+        return {"error": "PDF extraction failed", "details": str(e)}, 500
 
     if not text.strip():
-        return {"error": "PDF has no extractable text"}, 400
+        return {"error": "No text in PDF"}, 400
 
+    # preferences
     domain = request.form.get("domain", "General")
     subject = request.form.get("subject", "General")
     difficulty = request.form.get("difficulty", "medium")
     language = request.form.get("language", "English")
 
-    # Parse counts
+    # counts
     try:
         raw_counts = json.loads(request.form.get("counts", "{}"))
     except:
@@ -311,7 +307,7 @@ def generate():
 
     counts = normalize_counts(raw_counts)
 
-    # Build prompt & call LLM
+    # Prompt
     prompt = build_prompt(text, domain, subject, difficulty, language, counts)
 
     try:
@@ -319,12 +315,12 @@ def generate():
     except Exception as e:
         return {"error": "LLM call failed", "details": str(e)}, 500
 
-    result = extract_json(llm_out)
+    parsed = extract_json(llm_out)
 
-    return {"ok": True, "result": result}
+    return {"ok": True, "result": parsed}
 
 
-# ---------------------- EVALUATION ----------------------
+# ---------------------- EVALUATE ------------------------
 @app.route("/evaluate", methods=["POST"])
 def evaluate():
     data = request.get_json()
@@ -343,41 +339,36 @@ def evaluate():
     mcqs = questions.get("mcq", [])
     ua_mcq = user_answers.get("mcq", [])
 
-    for i, q in enumerate(mcqs):
+    for idx, q in enumerate(mcqs):
         correct_raw = q.get("answer", "")
-        user_choice = ua_mcq[i].strip().upper() if i < len(ua_mcq) else ""
+        correct_letter = correct_raw.split("||")[0].strip().upper()
+        user_letter = ua_mcq[idx].strip().upper() if idx < len(ua_mcq) else ""
 
-        correct = correct_raw.split("||")[0].strip().upper()
-
-        score = 1 if user_choice == correct else 0
+        score = 1 if user_letter == correct_letter else 0
 
         total_score += score
         max_score += 1
 
-        explanation = ""
-        if "||" in correct_raw:
-            explanation = correct_raw.split("||")[1]
-
         details.append({
             "type": "mcq",
             "question": q.get("question", ""),
-            "correct": correct,
-            "user": user_choice,
-            "score": score,
-            "explanation": explanation
+            "correct": correct_letter,
+            "user": user_letter,
+            "score": score
         })
 
-    # ---------- 2-Mark ----------
+    # ---------- 2-MARK ----------
     two_mark = questions.get("two_mark", [])
     ua_two = user_answers.get("two_mark", [])
 
-    for i, q in enumerate(two_mark):
+    for idx, q in enumerate(two_mark):
         correct = q.get("answer", "")
-        ans = ua_two[i] if i < len(ua_two) else ""
+        ans = ua_two[idx] if idx < len(ua_two) else ""
+
         marks = int(q.get("marks", 2))
 
         if use_ai:
-            prompt = build_eval_prompt("2-mark", q["question"], correct, ans, marks)
+            prompt = build_eval_prompt("2-mark", q.get("question", ""), correct, ans, marks)
             try:
                 llm_out = gemini_api(prompt)
                 parsed = extract_json(llm_out)
@@ -400,17 +391,17 @@ def evaluate():
             "feedback": feedback
         })
 
-    # ---------- 13-Mark ----------
-    th_mark = questions.get("thirteen_mark", [])
-    ua_th = user_answers.get("thirteen_mark", [])
+    # ---------- 13-MARK ----------
+    thirteen_mark = questions.get("thirteen_mark", [])
+    ua_thirteen = user_answers.get("thirteen_mark", [])
 
-    for i, q in enumerate(th_mark):
+    for idx, q in enumerate(thirteen_mark):
         correct = q.get("answer_outline", "")
-        ans = ua_th[i] if i < len(ua_th) else ""
+        ans = ua_thirteen[idx] if idx < len(ua_thirteen) else ""
         marks = int(q.get("marks", 13))
 
         if use_ai:
-            prompt = build_eval_prompt("13-mark", q["question"], correct, ans, marks)
+            prompt = build_eval_prompt("13-mark", q.get("question", ""), correct, ans, marks)
             try:
                 llm_out = gemini_api(prompt, max_tokens=800)
                 parsed = extract_json(llm_out)
@@ -421,7 +412,7 @@ def evaluate():
                 feedback = "AI scoring failed"
         else:
             score = 0
-            feedback = "Rule-based disabled for 13-mark"
+            feedback = "13-mark requires AI scoring"
 
         total_score += score
         max_score += marks
