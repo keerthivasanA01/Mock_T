@@ -22,7 +22,7 @@ import requests
 # CONFIG
 # -------------------------
 ALLOWED_EXTENSIONS = {"pdf"}
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-pro")
 MAX_TOKENS = 1200
 RETRIES = 3
 RETRY_DELAY = 1.3
