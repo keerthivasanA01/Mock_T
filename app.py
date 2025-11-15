@@ -91,7 +91,7 @@ def gemini_api(prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS, timeout: int =
         raise RuntimeError("GEMINI_API_KEY environment variable is not set.")
 
     model = GEMINI_MODEL
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=AIzaSyBb2thQ3RIayUIxn5fE7XgB_TrFjPz8Qdc"
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
